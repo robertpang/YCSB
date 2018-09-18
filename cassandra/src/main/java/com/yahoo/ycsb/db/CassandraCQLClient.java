@@ -26,6 +26,7 @@ import com.datastax.driver.core.Metadata;
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Row;
 import com.datastax.driver.core.Session;
+import com.datastax.driver.core.BatchStatement;
 import com.datastax.driver.core.PreparedStatement;
 import com.datastax.driver.core.BoundStatement;
 import com.datastax.driver.core.querybuilder.Insert;
@@ -114,6 +115,8 @@ public class CassandraCQLClient extends DB {
   public static final String TRACING_PROPERTY = "cassandra.tracing";
   public static final String TRACING_PROPERTY_DEFAULT = "false";
   
+  public static final String BATCH_SIZE_PROPERTY = "cassandra.batchsize";
+
   /**
    * Count the number of times initialized to teardown on the last
    * {@link #cleanup()}.
@@ -123,7 +126,10 @@ public class CassandraCQLClient extends DB {
   private static boolean debug = false;
 
   private static boolean trace = false;
-  
+
+  private int batchSize;
+  private BatchStatement batch;
+
   /**
    * Initialize any state for this DB. Called once per DB instance; there is one
    * DB instance per client thread.
@@ -209,6 +215,14 @@ public class CassandraCQLClient extends DB {
               .setReadTimeoutMillis(Integer.valueOf(readTimoutMillis));
         }
 
+        String batchSizeString = getProperties().getProperty(BATCH_SIZE_PROPERTY);
+        if (batchSizeString != null) {
+          batchSize = Integer.valueOf(batchSizeString);
+        }
+        if (batchSize > 0) {
+          batch = new BatchStatement(BatchStatement.Type.UNLOGGED);
+        }
+
         Metadata metadata = cluster.getMetadata();
         logger.info("Connected to cluster: {}\n",
             metadata.getClusterName());
@@ -233,6 +247,14 @@ public class CassandraCQLClient extends DB {
    */
   @Override
   public void cleanup() throws DBException {
+    if (batch != null && batch.size() > 0) {
+      try {
+        session.execute(batch);
+      } catch (Exception e) {
+        throw new DBException(e);
+      }
+    }
+
     synchronized (INIT_COUNT) {
       final int curInitCount = INIT_COUNT.decrementAndGet();
       if (curInitCount <= 0) {
@@ -252,6 +274,22 @@ public class CassandraCQLClient extends DB {
         // This should never happen.
         throw new DBException(
             String.format("initCount is negative: %d", curInitCount));
+      }
+    }
+  }
+
+  private void execute(BoundStatement stmt) throws DBException {
+    if (batch == null) {
+      session.execute(stmt);
+      return;
+    }
+
+    batch.add(stmt);
+    if (batch.size() >= batchSize) {
+      try {
+        session.execute(batch);
+      } finally {
+        batch.clear();
       }
     }
   }
@@ -502,7 +540,7 @@ public class CassandraCQLClient extends DB {
       // Add key
       boundStmt.setString(vars.size() - 1, key);
 
-      session.execute(boundStmt);
+      execute(boundStmt);
 
       return Status.OK;
     } catch (Exception e) {
@@ -573,7 +611,7 @@ public class CassandraCQLClient extends DB {
         boundStmt.setString(i, values.get(vars.getName(i)).toString());
       }
 
-      session.execute(boundStmt);
+      execute(boundStmt);
 
       return Status.OK;
     } catch (Exception e) {
@@ -616,7 +654,7 @@ public class CassandraCQLClient extends DB {
       logger.debug(stmt.getQueryString());
       logger.debug("key = {}", key);
 
-      session.execute(stmt.bind(key));
+      execute(stmt.bind(key));
 
       return Status.OK;
     } catch (Exception e) {
